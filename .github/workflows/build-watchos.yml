@@ -1,0 +1,63 @@
+name: Build watchOS IPA
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Xcode and watchOS SDK
+        run: |
+          xcodebuild -version
+          xcodebuild -showsdks
+          if ! xcodebuild -showsdks | grep -q "watchos"; then
+            echo "watchOS SDK not found, downloading..."
+            xcodebuild -downloadPlatform watchOS
+          fi
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Archive unsigned WatchHostApp (with embedded MyWatchApp)
+        run: |
+          xcodebuild archive \
+            -project ShinkiBusWatch.xcodeproj \
+            -scheme WatchHostApp \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/App.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Verify archive contains WatchHostApp and MyWatchApp
+        run: |
+          test -d "build/App.xcarchive/Products/Applications/WatchHostApp.app"
+          ls -la "build/App.xcarchive/Products/Applications/WatchHostApp.app"
+          test -d "build/App.xcarchive/Products/Applications/WatchHostApp.app/Watch/MyWatchApp.app"
+          ls -la "build/App.xcarchive/Products/Applications/WatchHostApp.app/Watch/MyWatchApp.app"
+
+      - name: Package MyWatchApp.ipa
+        run: |
+          rm -rf Payload MyWatchApp.ipa
+          mkdir -p Payload
+          cp -R "build/App.xcarchive/Products/Applications/WatchHostApp.app" Payload/
+          zip -r MyWatchApp.ipa Payload
+          ls -lh MyWatchApp.ipa
+
+      - name: Upload MyWatchApp.ipa artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyWatchApp-ipa
+          path: MyWatchApp.ipa
