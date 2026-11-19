@@ -175,6 +175,8 @@ struct BusItem: Identifiable, Equatable {
     let minutesUntilDeparture: Int
     let minutesUntilArrival: Int
     let delayMinutes: Int
+    let hasLiveData: Bool
+    let isRunningLive: Bool
     let note: String
     let location: BusPositionSummary
 }
@@ -183,6 +185,7 @@ struct BusStatusSnapshot {
     let updatedAt: String
     let dayType: ResolvedDayType
     let isLiveConnected: Bool
+    let liveStatusNote: String
     let isTomorrow: Bool
     let inTransitBuses: [BusItem]
     let upcomingBuses: [BusItem]

@@ -11,129 +11,212 @@ private enum JSTClock {
     }
 }
 
+struct LiveFetchResult {
+    let ok: Bool
+    let items: [String: LiveBusInfo]
+    let statusNote: String
+}
+
 final class ShinkiNaviLiveClient {
     private static let baseURL = "https://navi.shinkibus.jp"
     private static let userAgent =
         "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) " +
         "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
 
-    func fetchLive(direction: BusDirection, now: Date = Date()) async -> (ok: Bool, items: [String: LiveBusInfo]) {
+    func fetchLive(direction: BusDirection, now: Date = Date()) async -> LiveFetchResult {
         let config = URLSessionConfiguration.ephemeral
         config.httpCookieAcceptPolicy = .always
         config.httpShouldSetCookies = true
-        config.httpCookieStorage = HTTPCookieStorage()
-        config.timeoutIntervalForRequest = 4.5
-        config.timeoutIntervalForResource = 8.0
+        config.timeoutIntervalForRequest = 12.0
+        config.timeoutIntervalForResource = 25.0
 
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
 
+        var cookieMap: [String: String] = [:]
+
         do {
             guard let topURL = URL(string: "\(Self.baseURL)/") else {
-                return (false, [:])
+                return LiveFetchResult(ok: false, items: [:], statusNote: "時刻表(URL不正)")
             }
             var topReq = URLRequest(url: topURL)
             topReq.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
 
-            let (topData, _) = try await session.data(for: topReq)
+            let (topData, topResp) = try await session.data(for: topReq)
+            collectCookies(from: topResp, url: topURL, into: &cookieMap)
+
+            if let httpCode = (topResp as? HTTPURLResponse)?.statusCode, !(200...299).contains(httpCode) {
+                return LiveFetchResult(ok: false, items: [:], statusNote: "時刻表(HTTP \(httpCode))")
+            }
+
             let topHTML = String(data: topData, encoding: .utf8) ?? ""
             guard let csrfToken = extractCSRFToken(from: topHTML), !csrfToken.isEmpty else {
-                return (false, [:])
+                return LiveFetchResult(ok: false, items: [:], statusNote: "時刻表(CSRF失敗)")
             }
 
-            let queryDate = now.addingTimeInterval(-18 * 60)
-            let comps = JSTClock.calendar.dateComponents([.year, .month, .day, .hour, .minute], from: queryDate)
+            let lookbackDate = now.addingTimeInterval(-30 * 60)
+            let window1 = try await fetchUnkohWindow(
+                session: session,
+                cookieMap: &cookieMap,
+                csrfToken: csrfToken,
+                direction: direction,
+                queryDate: lookbackDate
+            )
+            if !(200...299).contains(window1.httpStatus) {
+                return LiveFetchResult(ok: false, items: [:], statusNote: "時刻表(HTTP \(window1.httpStatus))")
+            }
 
-            let formPairs: [(String, String)] = [
-                ("csrfmiddlewaretoken", csrfToken),
-                ("from_busstop", direction.fromStopCode),
-                ("from_busstop_name", direction.officialFromStopName),
-                ("que_start_text", direction.officialFromStopName),
-                ("to_busstop", direction.toStopCode),
-                ("to_busstop_name", direction.officialToStopName),
-                ("que_end_text", direction.officialToStopName),
-                ("genjikoku_isset", "not"),
-                ("date_year", String(comps.year ?? 2026)),
-                ("date_month", String(comps.month ?? 1)),
-                ("date_day", String(comps.day ?? 1)),
-                ("date_hour", String(comps.hour ?? 0)),
-                ("date_minute", String(comps.minute ?? 0)),
-                ("this_time_is", "start")
+            var merged = window1.items
+            let nowComps = JSTClock.calendar.dateComponents([.hour, .minute], from: now)
+            let nowHHMM = String(format: "%02d:%02d", nowComps.hour ?? 0, nowComps.minute ?? 0)
+            let upcomingCount = merged.values.filter { $0.depTime >= nowHHMM }.count
+
+            if upcomingCount < 4 {
+                if let window2 = try? await fetchUnkohWindow(
+                    session: session,
+                    cookieMap: &cookieMap,
+                    csrfToken: csrfToken,
+                    direction: direction,
+                    queryDate: now
+                ), (200...299).contains(window2.httpStatus) {
+                    mergeLiveItems(into: &merged, from: window2.items)
+                }
+            }
+
+            if merged.isEmpty {
+                return LiveFetchResult(ok: false, items: [:], statusNote: "時刻表(0件)")
+            }
+            return LiveFetchResult(ok: true, items: merged, statusNote: "Navi LIVE")
+        } catch let urlError as URLError {
+            let reason: String
+            switch urlError.code {
+            case .timedOut:
+                reason = "時刻表(タイムアウト)"
+            case .notConnectedToInternet, .networkConnectionLost, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed:
+                reason = "時刻表(オフライン)"
+            default:
+                reason = "時刻表(通信エラー)"
+            }
+            return LiveFetchResult(ok: false, items: [:], statusNote: reason)
+        } catch {
+            return LiveFetchResult(ok: false, items: [:], statusNote: "時刻表(通信エラー)")
+        }
+    }
+
+    private func fetchUnkohWindow(
+        session: URLSession,
+        cookieMap: inout [String: String],
+        csrfToken: String,
+        direction: BusDirection,
+        queryDate: Date
+    ) async throws -> (items: [String: LiveBusInfo], httpStatus: Int) {
+        let comps = JSTClock.calendar.dateComponents([.year, .month, .day, .hour, .minute], from: queryDate)
+
+        let formPairs: [(String, String)] = [
+            ("csrfmiddlewaretoken", csrfToken),
+            ("from_busstop", direction.fromStopCode),
+            ("from_busstop_name", direction.officialFromStopName),
+            ("que_start_text", direction.officialFromStopName),
+            ("to_busstop", direction.toStopCode),
+            ("to_busstop_name", direction.officialToStopName),
+            ("que_end_text", direction.officialToStopName),
+            ("genjikoku_isset", "not"),
+            ("date_year", String(comps.year ?? 2026)),
+            ("date_month", String(comps.month ?? 1)),
+            ("date_day", String(comps.day ?? 1)),
+            ("date_hour", String(comps.hour ?? 0)),
+            ("date_minute", String(comps.minute ?? 0)),
+            ("this_time_is", "start")
+        ]
+
+        guard let unkohURL = URL(string: "\(Self.baseURL)/unkoh/") else {
+            return ([:], 400)
+        }
+        var unkohReq = URLRequest(url: unkohURL)
+        unkohReq.httpMethod = "POST"
+        unkohReq.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+        unkohReq.setValue(Self.baseURL, forHTTPHeaderField: "Origin")
+        unkohReq.setValue("\(Self.baseURL)/", forHTTPHeaderField: "Referer")
+        unkohReq.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        if !cookieMap.isEmpty {
+            unkohReq.setValue(cookieHeaderValue(from: cookieMap), forHTTPHeaderField: "Cookie")
+        }
+        unkohReq.httpBody = formEncode(formPairs).data(using: .utf8)
+
+        let (unkohData, unkohResp) = try await session.data(for: unkohReq)
+        collectCookies(from: unkohResp, url: unkohURL, into: &cookieMap)
+
+        let statusCode = (unkohResp as? HTTPURLResponse)?.statusCode ?? 200
+        if !(200...299).contains(statusCode) {
+            return ([:], statusCode)
+        }
+
+        let unkohHTML = String(data: unkohData, encoding: .utf8) ?? ""
+        var liveByTime: [String: LiveBusInfo] = [:]
+        var proxyParams: [(hhmm: String, x: String, y: String, z: String, t: String, u: String)] = []
+
+        for cardHTML in extractResultCards(from: unkohHTML) {
+            let depRaw = extractTagText(in: cardHTML, classKeyword: "res_hatsu")
+            guard let hhmm = extractNormalizedHHMM(from: depRaw) else {
+                continue
+            }
+
+            let statusRaw = extractTagText(in: cardHTML, classKeyword: "info_unkou")
+            let statusText = statusRaw.isEmpty ? "定刻運行" : statusRaw
+
+            var delayMin = 0
+            if let matchStr = firstCapture(in: statusText, pattern: #"(\d+)\s*分遅れ"#),
+               let parsed = Int(matchStr) {
+                delayMin = parsed
+            } else if statusText.contains("少し遅れ") {
+                delayMin = 1
+            }
+
+            if let stepwellToken = firstCapture(in: cardHTML, pattern: #"(stepwell_[^"'\s>]+)"#) {
+                let parts = stepwellToken.split(separator: "_", omittingEmptySubsequences: false).map(String.init)
+                if parts.count >= 6 && parts[0] == "stepwell" {
+                    proxyParams.append((hhmm, parts[1], parts[2], parts[3], parts[4], parts[5]))
+                }
+            }
+
+            liveByTime[hhmm] = LiveBusInfo(
+                depTime: hhmm,
+                statusText: statusText,
+                delayMinutes: delayMin,
+                isRunning: !statusText.contains("運行前"),
+                gpsStationCode: nil,
+                gpsStationName: nil
+            )
+        }
+
+        if !proxyParams.isEmpty {
+            let xs = proxyParams.map(\.x).joined(separator: ",")
+            let ys = proxyParams.map(\.y).joined(separator: ",")
+            let zs = proxyParams.map(\.z).joined(separator: ",")
+            let ts = proxyParams.map(\.t).joined(separator: ",")
+            let us = proxyParams.map(\.u).joined(separator: ",")
+
+            var components = URLComponents(string: "\(Self.baseURL)/bus_proxy/")
+            components?.queryItems = [
+                URLQueryItem(name: "x", value: xs),
+                URLQueryItem(name: "y", value: ys),
+                URLQueryItem(name: "z", value: zs),
+                URLQueryItem(name: "t", value: ts),
+                URLQueryItem(name: "u", value: us)
             ]
 
-            guard let unkohURL = URL(string: "\(Self.baseURL)/unkoh/") else {
-                return (false, [:])
-            }
-            var unkohReq = URLRequest(url: unkohURL)
-            unkohReq.httpMethod = "POST"
-            unkohReq.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-            unkohReq.setValue("\(Self.baseURL)/", forHTTPHeaderField: "Referer")
-            unkohReq.setValue("application/x-www-form-urlencoded; charset=utf-8", forHTTPHeaderField: "Content-Type")
-            unkohReq.httpBody = formEncode(formPairs).data(using: .utf8)
-
-            let (unkohData, _) = try await session.data(for: unkohReq)
-            let unkohHTML = String(data: unkohData, encoding: .utf8) ?? ""
-
-            var liveByTime: [String: LiveBusInfo] = [:]
-            var proxyParams: [(hhmm: String, x: String, y: String, z: String, t: String, u: String)] = []
-
-            for cardHTML in extractResultCards(from: unkohHTML) {
-                let depRaw = extractTagText(in: cardHTML, classKeyword: "res_hatsu")
-                guard let hhmm = extractNormalizedHHMM(from: depRaw) else {
-                    continue
+            if let proxyURL = components?.url {
+                var proxyReq = URLRequest(url: proxyURL)
+                proxyReq.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+                proxyReq.setValue("\(Self.baseURL)/unkoh/", forHTTPHeaderField: "Referer")
+                proxyReq.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+                if !cookieMap.isEmpty {
+                    proxyReq.setValue(cookieHeaderValue(from: cookieMap), forHTTPHeaderField: "Cookie")
                 }
 
-                let statusRaw = extractTagText(in: cardHTML, classKeyword: "info_unkou")
-                let statusText = statusRaw.isEmpty ? "定刻運行" : statusRaw
-
-                var delayMin = 0
-                if let matchStr = firstCapture(in: statusText, pattern: #"(\d+)\s*分遅れ"#),
-                   let parsed = Int(matchStr) {
-                    delayMin = parsed
-                } else if statusText.contains("少し遅れ") {
-                    delayMin = 1
-                }
-
-                if let stepwellToken = firstCapture(in: cardHTML, pattern: #"(stepwell_[^"'\s>]+)"#) {
-                    let parts = stepwellToken.split(separator: "_", omittingEmptySubsequences: false).map(String.init)
-                    if parts.count >= 6 && parts[0] == "stepwell" {
-                        proxyParams.append((hhmm, parts[1], parts[2], parts[3], parts[4], parts[5]))
-                    }
-                }
-
-                liveByTime[hhmm] = LiveBusInfo(
-                    depTime: hhmm,
-                    statusText: statusText,
-                    delayMinutes: delayMin,
-                    isRunning: !statusText.contains("運行前"),
-                    gpsStationCode: nil,
-                    gpsStationName: nil
-                )
-            }
-
-            if !proxyParams.isEmpty {
-                let xs = proxyParams.map(\.x).joined(separator: ",")
-                let ys = proxyParams.map(\.y).joined(separator: ",")
-                let zs = proxyParams.map(\.z).joined(separator: ",")
-                let ts = proxyParams.map(\.t).joined(separator: ",")
-                let us = proxyParams.map(\.u).joined(separator: ",")
-
-                var components = URLComponents(string: "\(Self.baseURL)/bus_proxy/")
-                components?.queryItems = [
-                    URLQueryItem(name: "x", value: xs),
-                    URLQueryItem(name: "y", value: ys),
-                    URLQueryItem(name: "z", value: zs),
-                    URLQueryItem(name: "t", value: ts),
-                    URLQueryItem(name: "u", value: us)
-                ]
-
-                if let proxyURL = components?.url {
-                    var proxyReq = URLRequest(url: proxyURL)
-                    proxyReq.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-                    proxyReq.setValue("\(Self.baseURL)/unkoh/", forHTTPHeaderField: "Referer")
-
-                    let (proxyData, _) = try await session.data(for: proxyReq)
-                    if let proxyArray = try JSONSerialization.jsonObject(with: proxyData) as? [[String: Any]] {
+                if let (proxyData, proxyResp) = try? await session.data(for: proxyReq) {
+                    collectCookies(from: proxyResp, url: proxyURL, into: &cookieMap)
+                    if let proxyArray = try? JSONSerialization.jsonObject(with: proxyData) as? [[String: Any]] {
                         for (idx, item) in proxyArray.enumerated() {
                             guard idx < proxyParams.count else { break }
                             let hhmm = proxyParams[idx].hhmm
@@ -156,11 +239,43 @@ final class ShinkiNaviLiveClient {
                     }
                 }
             }
-
-            return (!liveByTime.isEmpty, liveByTime)
-        } catch {
-            return (false, [:])
         }
+
+        return (liveByTime, statusCode)
+    }
+
+    private func mergeLiveItems(into target: inout [String: LiveBusInfo], from incoming: [String: LiveBusInfo]) {
+        for (key, newItem) in incoming {
+            if let oldItem = target[key] {
+                target[key] = LiveBusInfo(
+                    depTime: oldItem.depTime,
+                    statusText: oldItem.statusText.isEmpty ? newItem.statusText : oldItem.statusText,
+                    delayMinutes: max(oldItem.delayMinutes, newItem.delayMinutes),
+                    isRunning: oldItem.isRunning || newItem.isRunning,
+                    gpsStationCode: oldItem.gpsStationCode ?? newItem.gpsStationCode,
+                    gpsStationName: oldItem.gpsStationName ?? newItem.gpsStationName
+                )
+            } else {
+                target[key] = newItem
+            }
+        }
+    }
+
+    private func collectCookies(from response: URLResponse, url: URL, into cookieMap: inout [String: String]) {
+        guard let httpResp = response as? HTTPURLResponse else { return }
+        var headerStrings: [String: String] = [:]
+        for (key, val) in httpResp.allHeaderFields {
+            if let ks = key as? String, let vs = val as? String {
+                headerStrings[ks] = vs
+            }
+        }
+        for cookie in HTTPCookie.cookies(withResponseHeaderFields: headerStrings, for: url) {
+            cookieMap[cookie.name] = cookie.value
+        }
+    }
+
+    private func cookieHeaderValue(from cookieMap: [String: String]) -> String {
+        cookieMap.keys.sorted().map { "\($0)=\(cookieMap[$0] ?? "")" }.joined(separator: "; ")
     }
 
     private func formEncode(_ pairs: [(String, String)]) -> String {
@@ -316,6 +431,7 @@ enum BusStatusCalculator {
         dayTypeMode: DayTypeMode,
         liveItems: [String: LiveBusInfo],
         isLiveConnected: Bool,
+        liveStatusNote: String,
         now: Date = Date()
     ) -> BusStatusSnapshot {
         let dayType = resolveDayType(mode: dayTypeMode, now: now)
@@ -335,6 +451,8 @@ enum BusStatusCalculator {
             let liveInfo = liveItems[entry.time]
             let delayMin = liveInfo?.delayMinutes ?? 0
             let gpsStation = liveInfo?.gpsStationName
+            let hasLiveData = (liveInfo != nil)
+            let isRunningLive = liveInfo?.isRunning ?? false
 
             let expectedMin = entry.scheduledMinutes + delayMin
             let minutesUntil = expectedMin - nowMinutes
@@ -347,8 +465,12 @@ enum BusStatusCalculator {
             let expectedArrivalStr = formatHHMM(arrMin)
             let minutesUntilArrival = arrMin - nowMinutes
 
-            if minutesUntil < 0 && minutesUntilArrival > 0 {
+            let isWithinRideWindow = (minutesUntil < 0 && minutesUntilArrival > 0)
+            let isRunningSlightlyOver = (isRunningLive && minutesUntil < 0 && minutesUntilArrival > -10)
+
+            if isWithinRideWindow || isRunningSlightlyOver {
                 let elapsed = max(0.0, nowMinutesFloat - Double(expectedMin))
+                let clampedArrivalMin = max(1, minutesUntilArrival)
                 let location = estimateInTransitPosition(
                     direction: direction,
                     elapsedSinceBoarding: elapsed,
@@ -370,8 +492,10 @@ enum BusStatusCalculator {
                         expectedTime: expectedTimeStr,
                         expectedArrivalTime: expectedArrivalStr,
                         minutesUntilDeparture: minutesUntil,
-                        minutesUntilArrival: minutesUntilArrival,
+                        minutesUntilArrival: clampedArrivalMin,
                         delayMinutes: delayMin,
+                        hasLiveData: hasLiveData,
+                        isRunningLive: isRunningLive,
                         note: entry.note,
                         location: location
                     )
@@ -405,6 +529,8 @@ enum BusStatusCalculator {
                     minutesUntilDeparture: minutesUntil,
                     minutesUntilArrival: minutesUntilArrival,
                     delayMinutes: delayMin,
+                    hasLiveData: hasLiveData,
+                    isRunningLive: isRunningLive,
                     note: entry.note,
                     location: location
                 )
@@ -431,6 +557,8 @@ enum BusStatusCalculator {
                         minutesUntilDeparture: minutesUntil,
                         minutesUntilArrival: minutesUntil + entry.rideMinutes,
                         delayMinutes: 0,
+                        hasLiveData: false,
+                        isRunningLive: false,
                         note: entry.note,
                         location: BusPositionSummary(
                             headline: "本日の運行終了",
@@ -447,6 +575,7 @@ enum BusStatusCalculator {
             updatedAt: String(format: "%02d:%02d", hour, minute),
             dayType: dayType,
             isLiveConnected: isLiveConnected,
+            liveStatusNote: liveStatusNote,
             isTomorrow: isTomorrow,
             inTransitBuses: inTransitBuses,
             upcomingBuses: Array(upcomingBuses.prefix(6))
@@ -644,8 +773,10 @@ final class BusViewModel: ObservableObject {
     @Published var selectedBusID: String?
 
     private let liveClient = ShinkiNaviLiveClient()
-    private var lastLiveItems: [String: LiveBusInfo] = [:]
-    private var lastLiveConnected: Bool = false
+    private var liveItemsByDirection: [BusDirection: [String: LiveBusInfo]] = [:]
+    private var liveConnectedByDirection: [BusDirection: Bool] = [:]
+    private var liveNoteByDirection: [BusDirection: String] = [:]
+    private var fetchGeneration: Int = 0
 
     init() {
         self.snapshot = BusStatusCalculator.buildSnapshot(
@@ -653,6 +784,7 @@ final class BusViewModel: ObservableObject {
             dayTypeMode: .auto,
             liveItems: [:],
             isLiveConnected: false,
+            liveStatusNote: "取得中...",
             now: Date()
         )
     }
@@ -673,20 +805,23 @@ final class BusViewModel: ObservableObject {
     }
 
     func refreshLive() async {
-        if isLoadingLive {
-            return
-        }
-        isLoadingLive = true
+        fetchGeneration += 1
+        let myGen = fetchGeneration
         let targetDirection = direction
-        let now = Date()
-        let result = await liveClient.fetchLive(direction: targetDirection, now: now)
+        isLoadingLive = true
+
+        let result = await liveClient.fetchLive(direction: targetDirection, now: Date())
+
+        liveItemsByDirection[targetDirection] = result.items
+        liveConnectedByDirection[targetDirection] = result.ok
+        liveNoteByDirection[targetDirection] = result.statusNote
 
         if direction == targetDirection {
-            lastLiveItems = result.items
-            lastLiveConnected = result.ok
             rebuildSnapshot(now: Date())
         }
-        isLoadingLive = false
+        if myGen == fetchGeneration {
+            isLoadingLive = false
+        }
     }
 
     func recalculateNow() {
@@ -697,8 +832,6 @@ final class BusViewModel: ObservableObject {
         direction = direction.toggled
         selectedBusID = nil
         viewingInTransit = false
-        lastLiveItems = [:]
-        lastLiveConnected = false
         rebuildSnapshot(now: Date())
         Task {
             await refreshLive()
@@ -726,11 +859,16 @@ final class BusViewModel: ObservableObject {
     }
 
     private func rebuildSnapshot(now: Date) {
+        let items = liveItemsByDirection[direction] ?? [:]
+        let connected = liveConnectedByDirection[direction] ?? false
+        let note = liveNoteByDirection[direction] ?? (isLoadingLive ? "取得中..." : "内蔵時刻表")
+
         snapshot = BusStatusCalculator.buildSnapshot(
             direction: direction,
             dayTypeMode: dayTypeMode,
-            liveItems: lastLiveItems,
-            isLiveConnected: lastLiveConnected,
+            liveItems: items,
+            isLiveConnected: connected,
+            liveStatusNote: note,
             now: now
         )
         if viewingInTransit && snapshot.inTransitBuses.isEmpty {

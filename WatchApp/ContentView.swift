@@ -24,7 +24,13 @@ struct ContentView: View {
                         emptyCard
                     }
 
-                    upcomingSection
+                    if viewModel.viewingInTransit {
+                        inTransitSection
+                        upcomingSection
+                    } else {
+                        upcomingSection
+                        inTransitSection
+                    }
 
                     footerSection
                 }
@@ -80,7 +86,9 @@ struct ContentView: View {
 
     private var modeSwitchBar: some View {
         let nextTime = viewModel.snapshot.upcomingBuses.first?.expectedTime ?? "--:--"
+        let transitCount = viewModel.snapshot.inTransitBuses.count
         let transitTime = viewModel.snapshot.inTransitBuses.last?.scheduledTime ?? "--:--"
+        let transitTitle = transitCount > 1 ? "走行中(\(transitCount)台)" : "走行中 \(transitTime)"
 
         return HStack(spacing: 4) {
             modePillButton(
@@ -90,7 +98,7 @@ struct ContentView: View {
                 viewModel.switchMode(inTransit: false)
             }
             modePillButton(
-                title: "乗車中 \(transitTime)",
+                title: transitTitle,
                 isSelected: viewModel.viewingInTransit
             ) {
                 viewModel.switchMode(inTransit: true)
@@ -289,6 +297,65 @@ struct ContentView: View {
         .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
+    private var inTransitSection: some View {
+        let buses = Array(viewModel.snapshot.inTransitBuses.reversed())
+        let activeID = viewModel.displayedBus?.id
+
+        return VStack(alignment: .leading, spacing: 4) {
+            if !buses.isEmpty {
+                Text("走行中のバス")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+                    .padding(.top, 2)
+
+                ForEach(buses) { bus in
+                    let isSelected = bus.id == activeID
+                    Button {
+                        viewModel.selectBus(bus)
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text("\(bus.scheduledTime)発")
+                                .font(.caption.weight(.bold))
+                                .monospacedDigit()
+
+                            Text(bus.routeLabel)
+                                .font(.system(size: 10, weight: .semibold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 2)
+                                .background(routeAccent.opacity(0.22), in: Capsule())
+                                .foregroundStyle(routeAccent)
+
+                            if bus.delayMinutes > 0 {
+                                Text("+\(bus.delayMinutes)分")
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundStyle(.orange)
+                            }
+
+                            Spacer(minLength: 2)
+
+                            Text("着あと\(max(1, bus.minutesUntilArrival))分")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.mint)
+                                .monospacedDigit()
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .background(
+                            isSelected ? routeAccent.opacity(0.24) : Color.white.opacity(0.06),
+                            in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                .stroke(isSelected ? routeAccent.opacity(0.8) : Color.clear, lineWidth: 1)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
     private var upcomingSection: some View {
         let buses = viewModel.snapshot.upcomingBuses
         let activeID = viewModel.displayedBus?.id
@@ -306,7 +373,7 @@ struct ContentView: View {
                     Button {
                         viewModel.selectBus(bus)
                     } label: {
-                        HStack(spacing: 6) {
+                        HStack(spacing: 5) {
                             Text(bus.expectedTime)
                                 .font(.caption.weight(.bold))
                                 .monospacedDigit()
@@ -330,12 +397,12 @@ struct ContentView: View {
                                 Text("+\(bus.delayMinutes)分")
                                     .font(.system(size: 10, weight: .semibold))
                                     .foregroundStyle(.orange)
-                            } else {
-                                Text(shortCountdown(minutes: bus.minutesUntilDeparture))
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                                    .monospacedDigit()
                             }
+
+                            Text(shortCountdown(minutes: bus.minutesUntilDeparture))
+                                .font(.caption2)
+                                .foregroundStyle(bus.delayMinutes > 0 ? .orange : .secondary)
+                                .monospacedDigit()
                         }
                         .padding(.horizontal, 10)
                         .padding(.vertical, 7)
@@ -404,9 +471,11 @@ struct ContentView: View {
                 .buttonStyle(.plain)
             }
 
-            Text("\(viewModel.snapshot.updatedAt)更新・\(viewModel.snapshot.isLiveConnected ? "Navi LIVE" : "内蔵時刻表")")
+            Text("\(viewModel.snapshot.updatedAt)更新・\(viewModel.snapshot.liveStatusNote)")
                 .font(.system(size: 10))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(viewModel.snapshot.isLiveConnected ? .green : .secondary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
         }
         .padding(.top, 4)
     }
